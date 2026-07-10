@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.28;
 
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -161,7 +161,7 @@ contract HarbergerTitleNFT is ERC721 {
      *
      * @param pricePayed 买家愿意支付的价格，必须 >= 当前自报价
      */
-    function buyout(uint256 pricePayed) external {
+    function buyout(uint256 pricePayed) external withTransferUnlocked {
         require(holder != address(0), "Not minted");
         require(msg.sender != holder, "Holder cannot buyout own NFT");
         require(pricePayed >= selfAssessedPrice, "Price too low");
@@ -170,15 +170,15 @@ contract HarbergerTitleNFT is ERC721 {
         uint256 price = selfAssessedPrice;
 
         // 第一步：结算前任持有者的欠税
-        uint256 owedTax = _calculateOwedTax();
+        uint256 owed = _calculateOwedTax();
         lastSettlementTime = block.timestamp;
 
         uint256 taxDeducted;
         uint256 escrowRefund;
 
-        if (owedTax <= escrowBalance) {
+        if (owed <= escrowBalance) {
             // 税金从押金中扣除
-            taxDeducted = owedTax;
+            taxDeducted = owed;
             escrowRefund = escrowBalance - taxDeducted;
         } else {
             // 押金不足以覆盖全部税金（边界情况）
@@ -214,7 +214,7 @@ contract HarbergerTitleNFT is ERC721 {
      *
      * @param pricePayed 支付的价格（如果 floorPrice > 0，则必须 >= floorPrice）
      */
-    function claimForeclosed(uint256 pricePayed) external {
+    function claimForeclosed(uint256 pricePayed) external withTransferUnlocked {
         require(holder != address(0), "Not minted");
         require(msg.sender != holder, "Holder cannot claim own NFT");
         require(_isForeclosed(), "Not in foreclosure");
@@ -223,11 +223,8 @@ contract HarbergerTitleNFT is ERC721 {
         address previousHolder = holder;
 
         // 结算欠税（此时押金已经为 0 或不足以覆盖欠税）
-        uint256 owedTax = _calculateOwedTax();
-        lastSettlementTime = block.timestamp;
-
-        // 扣除剩余押金作为税金（如果有）
         // 押金不足的部分，前任持有者不再追讨
+        lastSettlementTime = block.timestamp;
 
         // 如果有 floorPrice，支付给合约（可以分配给社区或销毁）
         if (pricePayed > 0) {
@@ -333,24 +330,24 @@ contract HarbergerTitleNFT is ERC721 {
         return _calculateOwedTax() > escrowBalance;
     }
 
-    // ─────────────────── ERC-721 覆写 ───────────────────
+    // ─────────────────── ERC-721 转移控制 ───────────────────
+
+    /// @dev 转移锁：默认锁定，只有 buyout/claimForeclosed 内部解锁后才能转移
+    bool private _transferLocked = true;
 
     /**
-     * @dev 禁用标准的 transferFrom/approve 等函数。
-     *      NFT 的转移只能通过 buyout() 或 claimForeclosed() 触发。
-     *      这是设计上的刻意选择：哈伯格税的强制出售权必须通过合约逻辑控制，
-     *      不能让持有者通过私下转让来规避税金。
+     * @dev 通过覆写 _update 钩子来拦截所有 NFT 转移。
+     *      OpenZeppelin v5 的 _transfer()、_mint()、_burn() 都会调用 _update()。
+     *      我们在这里加锁：外部调用 transferFrom 时会触发 revert，
+     *      而 buyout/claimForeclosed 内部会先解锁再调用 _transfer。
      */
-    function transferFrom(address, address, uint256) public pure override {
-        revert("Use buyout() or claimForeclosed()");
-    }
-
-    function safeTransferFrom(address, address, uint256) public pure override {
-        revert("Use buyout() or claimForeclosed()");
-    }
-
-    function safeTransferFrom(address, address, uint256, bytes calldata) public pure override {
-        revert("Use buyout() or claimForeclosed()");
+    function _update(address to, uint256 tokenId, address auth) internal virtual override returns (address) {
+        // _mint 时 to != address(0)，_burn 时 to == address(0)
+        // 只有在转移（非 mint）且锁定期时才拦截
+        if (_transferLocked && to != address(0) && _ownerOf(tokenId) != address(0)) {
+            revert("Use buyout() or claimForeclosed()");
+        }
+        return super._update(to, tokenId, auth);
     }
 
     /**
@@ -362,5 +359,15 @@ contract HarbergerTitleNFT is ERC721 {
 
     function setApprovalForAll(address, bool) public pure override {
         revert("Approvals disabled");
+    }
+
+    /**
+     * @dev 临时解锁转移权限，仅在 buyout/claimForeclosed 内部使用。
+     *      这是一个"受控后门"——只有合约自己的函数能打开这扇门。
+     */
+    modifier withTransferUnlocked() {
+        _transferLocked = false;
+        _;
+        _transferLocked = true;
     }
 }
