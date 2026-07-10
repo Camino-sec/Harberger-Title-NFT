@@ -1,0 +1,16 @@
+node_modules/
+cache/
+artifacts/
+typechain-types/
+coverage/
+coverage.json
+
+# Hardhat
+.env
+
+# Foundry
+out/
+broadcast/
+
+# OS
+.DS_Store
