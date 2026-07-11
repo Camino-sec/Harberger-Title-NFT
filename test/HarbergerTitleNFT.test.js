@@ -161,16 +161,17 @@ describe("HarbergerTitleNFT", function () {
       await nft.connect(userA).mint(initialPrice, deposit);
     });
 
-    it("用户 B 可以强制买断 NFT", async function () {
+    it("用户 B 可以强制买断 NFT（同时充值押金）", async function () {
       // 快进 200 天
       await time.increase(200 * 24 * 60 * 60);
 
       const buyoutPrice = ethers.parseEther("100");
-      await token.connect(userB).approve(await nft.getAddress(), buyoutPrice);
+      const buyoutDeposit = ethers.parseEther("20");
+      await token.connect(userB).approve(await nft.getAddress(), buyoutPrice + buyoutDeposit);
 
       const aBalanceBefore = await token.balanceOf(userA.address);
 
-      await nft.connect(userB).buyout(buyoutPrice);
+      await nft.connect(userB).buyout(buyoutPrice, buyoutDeposit);
 
       // 验证 NFT 转移
       expect(await nft.holder()).to.equal(userB.address);
@@ -178,13 +179,16 @@ describe("HarbergerTitleNFT", function () {
       // 验证 A 收到了买断价格
       const aBalanceAfter = await token.balanceOf(userA.address);
       expect(aBalanceAfter - aBalanceBefore).to.be.greaterThan(0);
+
+      // 验证 B 的押金已经在同一笔交易里落地
+      expect(await nft.escrowBalance()).to.equal(buyoutDeposit);
     });
 
     it("价格不足时不能买断", async function () {
       const lowPrice = ethers.parseEther("50");
       await token.connect(userB).approve(await nft.getAddress(), lowPrice);
 
-      await expect(nft.connect(userB).buyout(lowPrice)).to.be.revertedWith(
+      await expect(nft.connect(userB).buyout(lowPrice, 0)).to.be.revertedWith(
         "Price too low"
       );
     });
@@ -192,9 +196,51 @@ describe("HarbergerTitleNFT", function () {
     it("持有者不能买断自己的 NFT", async function () {
       await token.connect(userA).approve(await nft.getAddress(), initialPrice);
 
-      await expect(nft.connect(userA).buyout(initialPrice)).to.be.revertedWith(
+      await expect(nft.connect(userA).buyout(initialPrice, 0)).to.be.revertedWith(
         "Holder cannot buyout own NFT"
       );
+    });
+
+    // ────────────────────────────────────────────────────────────
+    // 回归测试：修复"买断后零押金窗口"漏洞
+    // 原始版本里 buyout() 会把新持有人的 escrowBalance 强制设为 0，
+    // 导致买断成功的下一个区块，任何人都能立刻用 claimForeclosed() 抢走。
+    // ────────────────────────────────────────────────────────────
+    describe("回归测试：买断后的零押金窗口", function () {
+      it("【修复前会失败】不带押金买断后，下一秒就可能被立刻违约申领——这是买家自己的选择，而不是被强迫的隐藏陷阱", async function () {
+        const buyoutPrice = ethers.parseEther("100");
+        await token.connect(userB).approve(await nft.getAddress(), buyoutPrice);
+
+        // B 故意选择 depositAmount = 0（不充值押金）
+        await nft.connect(userB).buyout(buyoutPrice, 0);
+        expect(await nft.holder()).to.equal(userB.address);
+        expect(await nft.foreclosed()).to.equal(false); // 同一区块内，elapsed = 0
+
+        // 只要过 1 秒，B 因为零押金，会立刻重新进入违约状态
+        await time.increase(1);
+        expect(await nft.foreclosed()).to.equal(true);
+
+        // 此时任何人都可以把 B 刚买到手的头衔免费/低价申领走
+        await token.connect(userC).approve(await nft.getAddress(), FLOOR_PRICE);
+        await nft.connect(userC).claimForeclosed(FLOOR_PRICE, 0);
+        expect(await nft.holder()).to.equal(userC.address);
+      });
+
+      it("【核心修复验证】买断时一并充值押金，可以避免被立刻违约申领", async function () {
+        const buyoutPrice = ethers.parseEther("100");
+        const buyoutDeposit = ethers.parseEther("20"); // 按 10% 年化，能撑约 2 年
+        await token.connect(userB).approve(
+          await nft.getAddress(),
+          buyoutPrice + buyoutDeposit
+        );
+
+        await nft.connect(userB).buyout(buyoutPrice, buyoutDeposit);
+
+        // 过去 30 天，B 仍然安全，不会被违约申领
+        await time.increase(30 * 24 * 60 * 60);
+        expect(await nft.foreclosed()).to.equal(false);
+        expect(await nft.holder()).to.equal(userB.address);
+      });
     });
   });
 
@@ -221,10 +267,23 @@ describe("HarbergerTitleNFT", function () {
       await time.increase(366 * 24 * 60 * 60); // 366 天，进入违约
 
       const claimPrice = FLOOR_PRICE;
-      await token.connect(userC).approve(await nft.getAddress(), claimPrice);
-      await nft.connect(userC).claimForeclosed(claimPrice);
+      const claimDeposit = ethers.parseEther("5");
+      await token.connect(userC).approve(await nft.getAddress(), claimPrice + claimDeposit);
+      await nft.connect(userC).claimForeclosed(claimPrice, claimDeposit);
 
       expect(await nft.holder()).to.equal(userC.address);
+      expect(await nft.foreclosed()).to.equal(false);
+      expect(await nft.escrowBalance()).to.equal(claimDeposit);
+    });
+
+    it("申领时同样可以一并充值押金，避免立刻重新违约", async function () {
+      await time.increase(366 * 24 * 60 * 60);
+
+      const claimDeposit = ethers.parseEther("5");
+      await token.connect(userC).approve(await nft.getAddress(), FLOOR_PRICE + claimDeposit);
+      await nft.connect(userC).claimForeclosed(FLOOR_PRICE, claimDeposit);
+
+      await time.increase(10 * 24 * 60 * 60); // 再过 10 天
       expect(await nft.foreclosed()).to.equal(false);
     });
   });
