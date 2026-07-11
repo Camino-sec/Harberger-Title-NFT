@@ -4,6 +4,7 @@ pragma solidity ^0.8.28;
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * @title HarbergerTitleNFT
@@ -18,7 +19,7 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
  *      这个机制逼迫持有者在「报高价怕被买走」和「报低价少交税」之间做博弈，
  *      从而让稀缺资产始终有一个合理的市场定价，并保持流动性。
  */
-contract HarbergerTitleNFT is ERC721 {
+contract HarbergerTitleNFT is ERC721, ReentrancyGuard {
 
     using SafeERC20 for IERC20;
 
@@ -89,7 +90,7 @@ contract HarbergerTitleNFT is ERC721 {
      * @param initialPrice  初始自报价
      * @param depositAmount 初始押金金额
      */
-    function mint(uint256 initialPrice, uint256 depositAmount) external {
+    function mint(uint256 initialPrice, uint256 depositAmount) external nonReentrant {
         require(holder == address(0), "Already minted");
         require(initialPrice > 0, "Price must be > 0");
         // 押金可以为 0，但持有者需要理解这样会很快违约
@@ -114,7 +115,7 @@ contract HarbergerTitleNFT is ERC721 {
      * @dev    这个函数在充值时会先结算当前欠税（惰性求值），
      *         确保充值的金额不会被立刻用于覆盖之前的欠税。
      */
-    function depositCollateral(uint256 amount) external {
+    function depositCollateral(uint256 amount) external nonReentrant {
         require(msg.sender == holder, "Only holder can deposit");
         require(amount > 0, "Amount must be > 0");
 
@@ -154,14 +155,27 @@ contract HarbergerTitleNFT is ERC721 {
      * @notice 强制买断：任何人支付当前自报价即可获得 NFT。
      * @dev    这是哈伯格税最关键的博弈机制——"强制出售权"。
      *
+     *         【修复说明 / FIX】原实现在买断后把 escrowBalance 置为 0，
+     *         并把"充值押金"描述成买家的可选后续操作。但只要 escrowBalance = 0，
+     *         下一个区块只要有极小的欠税产生（owedTax > 0 = escrowBalance），
+     *         _isForeclosed() 就会立刻为 true —— 也就是说，新买家在自己买断成功后
+     *         的下一个区块，就可能被任何第三方用 claimForeclosed() 免费/低价抢走。
+     *         现在改为买家必须在同一笔交易里同时提交初始押金，杜绝这个"零押金窗口"。
+     *
      *         资金流向：
      *         1. 买家支付的价格 → 转给前任持有者
-     *         2. 前任持有者的欠税 → 从其押金中扣除，留在合约中
-     *         3. 前任持有者剩余的押金 → 退还给前任持有者
+     *         2. 买家的初始押金 → 转入合约（原子完成，不再有零押金窗口）
+     *         3. 前任持有者的欠税 → 从其押金中扣除，留在合约中
+     *         4. 前任持有者剩余的押金 → 退还给前任持有者
      *
-     * @param pricePayed 买家愿意支付的价格，必须 >= 当前自报价
+     *         同时按 Checks-Effects-Interactions 模式重排：所有状态更新
+     *         （holder、escrowBalance、NFT 转移）都在外部 token 转账之前完成，
+     *         并加上 nonReentrant 双重保护。
+     *
+     * @param pricePayed    买家愿意支付的价格，必须 >= 当前自报价
+     * @param depositAmount 买家为自己的新头衔预存的税金押金（建议 > 0，否则很快会重新违约）
      */
-    function buyout(uint256 pricePayed) external withTransferUnlocked {
+    function buyout(uint256 pricePayed, uint256 depositAmount) external nonReentrant withTransferUnlocked {
         require(holder != address(0), "Not minted");
         require(msg.sender != holder, "Holder cannot buyout own NFT");
         require(pricePayed >= selfAssessedPrice, "Price too low");
@@ -169,42 +183,32 @@ contract HarbergerTitleNFT is ERC721 {
         address previousHolder = holder;
         uint256 price = selfAssessedPrice;
 
-        // 第一步：结算前任持有者的欠税
+        // ── Effects：先算清楚欠税，再一次性把所有状态更新完 ──
         uint256 owed = _calculateOwedTax();
+        uint256 taxDeducted = owed <= escrowBalance ? owed : escrowBalance;
+        uint256 escrowRefund = escrowBalance - taxDeducted;
+
+        holder = msg.sender;
+        selfAssessedPrice = price;          // 新持有者可以用 setPrice() 修改
+        escrowBalance = depositAmount;      // 关键修复：新持有者的押金在买断当笔交易内就位
         lastSettlementTime = block.timestamp;
 
-        uint256 taxDeducted;
-        uint256 escrowRefund;
+        _transfer(previousHolder, msg.sender, 0);
 
-        if (owed <= escrowBalance) {
-            // 税金从押金中扣除
-            taxDeducted = owed;
-            escrowRefund = escrowBalance - taxDeducted;
-        } else {
-            // 押金不足以覆盖全部税金（边界情况）
-            // 税金只能扣到押金归零，剩余欠税由前任承担（合约不追讨）
-            taxDeducted = escrowBalance;
-            escrowRefund = 0;
+        emit TaxSettled(previousHolder, taxDeducted, "buyout");
+        emit Buyout(msg.sender, previousHolder, price, taxDeducted, escrowRefund);
+        if (depositAmount > 0) {
+            emit CollateralDeposited(msg.sender, depositAmount);
         }
 
-        // 第二步：从买家处收取买断价格的代币，转给前任持有者
+        // ── Interactions：状态已经落定之后，才做外部代币转账 ──
+        if (depositAmount > 0) {
+            paymentToken.safeTransferFrom(msg.sender, address(this), depositAmount);
+        }
         paymentToken.safeTransferFrom(msg.sender, previousHolder, price);
-
-        // 第三步：退还前任持有者的剩余押金
         if (escrowRefund > 0) {
             paymentToken.safeTransfer(previousHolder, escrowRefund);
         }
-
-        // 第四步：转移 NFT 所有权
-        _transfer(previousHolder, msg.sender, 0);
-
-        // 第五步：重置状态，新持有者从零开始
-        holder = msg.sender;
-        selfAssessedPrice = price;          // 新持有者可以用 setPrice() 修改
-        escrowBalance = 0;                  // 新持有者需要重新充值押金
-        lastSettlementTime = block.timestamp;
-
-        emit Buyout(msg.sender, previousHolder, price, taxDeducted, escrowRefund);
     }
 
     /**
@@ -212,9 +216,14 @@ contract HarbergerTitleNFT is ERC721 {
      * @dev    这是防止"占坑不拉屎"的最后一道防线。
      *         持有者如果连税金都交不起了，头衔就会被释放给社区。
      *
-     * @param pricePayed 支付的价格（如果 floorPrice > 0，则必须 >= floorPrice）
+     * @dev    同样存在"零押金窗口"问题：申领后如果 escrowBalance 仍为 0，
+     *         下一个区块又会立刻重新进入违约状态，被别人再次免费申领。
+     *         所以这里也让申领人可以在同一笔交易里带上初始押金。
+     *
+     * @param pricePayed    支付的价格（如果 floorPrice > 0，则必须 >= floorPrice）
+     * @param depositAmount 申领人为自己的新头衔预存的税金押金（建议 > 0）
      */
-    function claimForeclosed(uint256 pricePayed) external withTransferUnlocked {
+    function claimForeclosed(uint256 pricePayed, uint256 depositAmount) external nonReentrant withTransferUnlocked {
         require(holder != address(0), "Not minted");
         require(msg.sender != holder, "Holder cannot claim own NFT");
         require(_isForeclosed(), "Not in foreclosure");
@@ -222,26 +231,26 @@ contract HarbergerTitleNFT is ERC721 {
 
         address previousHolder = holder;
 
-        // 结算欠税（此时押金已经为 0 或不足以覆盖欠税）
-        // 押金不足的部分，前任持有者不再追讨
-        lastSettlementTime = block.timestamp;
-
-        // 如果有 floorPrice，支付给合约（可以分配给社区或销毁）
-        if (pricePayed > 0) {
-            paymentToken.safeTransferFrom(msg.sender, address(this), pricePayed);
-        }
-
-        // 转移 NFT
-        _transfer(previousHolder, msg.sender, 0);
-
-        // 重置状态
+        // ── Effects：先把所有状态更新完 ──
+        // 前任持有者的欠税已经超过其押金（违约判定条件），押金不足的部分不再追讨。
         holder = msg.sender;
         selfAssessedPrice = floorPrice > 0 ? floorPrice : 1;
-        escrowBalance = 0;
+        escrowBalance = depositAmount;      // 关键修复：申领人的押金在申领当笔交易内就位
         lastSettlementTime = block.timestamp;
         isForeclosed = false;
 
+        _transfer(previousHolder, msg.sender, 0);
+
         emit ForeclosedNFTClaimed(msg.sender, pricePayed);
+        if (depositAmount > 0) {
+            emit CollateralDeposited(msg.sender, depositAmount);
+        }
+
+        // ── Interactions：状态落定之后，才做外部代币转账 ──
+        uint256 totalIn = pricePayed + depositAmount;
+        if (totalIn > 0) {
+            paymentToken.safeTransferFrom(msg.sender, address(this), totalIn);
+        }
     }
 
     // ─────────────────── 视图函数 ───────────────────
