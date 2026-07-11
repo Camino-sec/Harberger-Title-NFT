@@ -21,7 +21,7 @@
 
 | 问题 | 传统系统的症状 | 哈伯格税的解法 |
 |------|--------------|--------------|
-| **占坑不拉屎（Squatting）** | 早期用户抢到稀缺头衔后永远不卖，即使他们已经不活跃 | 税金机制迫使持有者持续"付费"维持所有权。如果你不珍惜这个头衔，税金会把你赶走。 |
+| **投机性囤积（Speculative Squatting）** | 在传统的NFT或域名机制中，早期用户抢占稀缺资源后往往会选择长期闲置，导致资产无法流转到真正有需求的用户手中。 | 哈伯格税（Harberger Tax）通过引入持续的持有成本（税金），迫使持有者权衡其自估价与真实持有价值。如果持有者不再积极维护或无力承担税金，资产将通过清算或买断流转到更能发挥其价值的活跃用户手中，从而有效提升资产的配置效率。。 |
 | **流动性僵化** | 想买的人买不到，想卖的人不知道定什么价 | 强制买断权 + 自报价机制，让市场始终有一个清晰的价格信号。持有者在"报高价怕被买走"和"报低价少交税"之间博弈，价格自然趋向合理。 |
 
 ### 一句话总结
@@ -40,8 +40,8 @@
 | 2 | 铸造 NFT 并充入押金 | `HarbergerTitleNFT.mint(price, deposit)` | ✅ | 需要先完成 #1 |
 | 3 | 充值税金押金 | `HarbergerTitleNFT.depositCollateral(amount)` | ✅ | 需要先 Approve |
 | 4 | 更新自报价 | `HarbergerTitleNFT.setPrice(newPrice)` | ✅ | 不需要 |
-| 5 | 强制买断 | `HarbergerTitleNFT.buyout(price)` | ✅ | 需要先 Approve |
-| 6 | 申领违约 NFT | `HarbergerTitleNFT.claimForeclosed(price)` | ✅ | 需要先 Approve（如果 floorPrice > 0） |
+| 5 | 强制买断（同时充值押金） | `HarbergerTitleNFT.buyout(price, depositAmount)` | ✅ | 需要先 Approve(price + depositAmount) |
+| 6 | 申领违约 NFT（同时充值押金） | `HarbergerTitleNFT.claimForeclosed(price, depositAmount)` | ✅ | 需要先 Approve(price + depositAmount) |
 
 **查询操作**（不产生交易，不消耗 Gas）：
 - `owedTax()` — 查询当前欠税
@@ -111,10 +111,23 @@
 
 在将合约部署到主网之前，建议重点审查：
 
-- [ ] **重入攻击（Reentrancy）**：`buyout()` 中的代币转移是否可能被恶意合约重入？（SafeERC20 + 状态更新在转账之后可以缓解）
+- [x] **重入攻击（Reentrancy）**：`buyout()` / `claimForeclosed()` / `mint()` / `depositCollateral()` 已加 `nonReentrant`，且状态更新已重排到外部转账之前（Checks-Effects-Interactions）。
 - [ ] **整数溢出**：`_calculateOwedTax()` 中的乘法是否会溢出 uint256？（在极端参数下需要检查）
 - [ ] **精度损失**：先乘后除的运算顺序是否会导致中间结果溢出？（需要根据实际参数范围验证）
 - [ ] **时间戳操纵**：矿工是否可以通过操纵 `block.timestamp` 来影响税金计算？（通常影响在 15 秒以内，可接受）
+
+### 4.6 买断/申领后的"零押金窗口"（已修复，AI 辅助发现 + 人工验证）
+
+**发现过程**：这是一处由 AI 辅助代码审查（Claude）发现、经人工读代码交叉验证后确认的真实设计缺陷，而不是理论上的边界情况。
+
+**原始问题**：`buyout()` 和 `claimForeclosed()` 在完成交易后都会把新持有人的 `escrowBalance` 强制置为 `0`，而"充值押金"被文档描述成买家/申领人之后"可选"的下一步操作。但 `_isForeclosed()` 的判定是 `owedTax > escrowBalance`——只要 `escrowBalance = 0`，下一个区块只要产生一丁点欠税，NFT 就会立刻重新进入违约状态。也就是说，**买断/申领成功后的下一个区块，任何第三方都可能免费或低价把刚到手的头衔抢走**，这在 Monad 这种出块极快的链上是一个真实可利用的窗口，不是纸面风险。
+
+**人工判断**：
+- 判断这个问题足够严重，值得改动函数签名（属于 breaking change），而不是仅在文档里提醒用户"记得马上充值"。
+- 决定把"是否充值、充多少"的权利交还给买家/申领人本人（`depositAmount` 参数可以为 `0`），而不是强制要求必须充值——因为某些场景下用户可能有意接受被快速买断的风险，这应该是一个清晰的、可选的参数，而不是一个隐藏的陷阱。
+- 顺手把 `buyout()` / `claimForeclosed()` 的执行顺序改成了 Checks-Effects-Interactions（详见 4.5），并加了 `nonReentrant`。
+
+**修复**：`buyout(price, depositAmount)` 和 `claimForeclosed(price, depositAmount)` 现在允许买家/申领人在同一笔交易里原子地完成"买断/申领 + 充值押金"，不再有零押金窗口。对应的回归测试见 `test/HarbergerTitleNFT.test.js` 中的"回归测试：买断后的零押金窗口"。
 
 ---
 
