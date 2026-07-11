@@ -62,8 +62,10 @@ netEscrowBalance（净值） = 5.07 TOKEN
 **时间点**：铸造后第 200 天。
 
 **B 的操作**：
-1. B 调用 `MockERC20.approve(harbergerContract, 100 TOKEN)`
-2. B 调用 `HarbergerTitleNFT.buyout(pricePayed=100 TOKEN)`
+1. B 调用 `MockERC20.approve(harbergerContract, 120 TOKEN)`（100 买断价 + 20 押金）
+2. B 调用 `HarbergerTitleNFT.buyout(pricePayed=100 TOKEN, depositAmount=20 TOKEN)`
+
+> **为什么买断时就要带上押金？** 早期版本里 `escrowBalance` 在买断后会被清零，"充值押金"是买家事后"可选"的下一步——但这意味着买断成功的下一个区块，B 的押金是 0，欠税立刻大于押金，B 会瞬间重新进入违约状态，被任何第三方免费/低价抢走。现在 `buyout()` 要求押金和买断在同一笔交易里原子完成，堵住这个"零押金窗口"（详见 README 4.6）。
 
 **合约内部执行流程**：
 
@@ -90,10 +92,10 @@ netEscrowBalance（净值） = 5.07 TOKEN
 │ ④ 转移 NFT                                            │
 │    NFT(0) 的持有者：A → B                               │
 │                                                       │
-│ ⑤ 重置状态                                             │
+│ ⑤ 重置状态（与④之前的转账合并为一笔交易，原子完成）      │
 │    holder = B                                          │
 │    selfAssessedPrice = 100 TOKEN（继承 A 的定价）       │
-│    escrowBalance = 0（B 需要重新充值）                  │
+│    escrowBalance = 20 TOKEN（B 买断时一并充值，不再为 0）│
 │    lastSettlementTime = 当前时间                        │
 │                                                       │
 └─────────────────────────────────────────────────────┘
@@ -104,11 +106,11 @@ netEscrowBalance（净值） = 5.07 TOKEN
 | 角色 | 变化 |
 |------|------|
 | A | +100 TOKEN（卖价）+ 4.52 TOKEN（押金退还）= **+14.52 TOKEN**，失去 NFT |
-| B | -100 TOKEN（买断价），获得 NFT，押金为 0（需自行充值） |
-| 合约 | +5.48 TOKEN（税金留在合约中） |
+| B | -100 TOKEN（买断价）- 20 TOKEN（自己的新押金），获得 NFT，escrowBalance = 20 TOKEN |
+| 合约 | +5.48 TOKEN（A 的税金留在合约中）+ 20 TOKEN（B 的新押金） |
 
-**B 买断后的操作**（可选）：
-1. B 调用 `depositCollateral(20 TOKEN)` 充值押金
+**B 买断之后可选的后续操作**（押金已经在买断时到位，不再是紧急操作）：
+1. B 可以随时调用 `depositCollateral(更多 TOKEN)` 追加押金
 2. B 调用 `setPrice(150 TOKEN)` 提高售价（意味着每年要交 15 TOKEN 的税）
 
 ---
@@ -148,10 +150,10 @@ isForeclosed     = true
 ### Step 5：角色 C 申领违约 NFT
 
 **C 的操作**：
-1. C 调用 `MockERC20.approve(harbergerContract, floorPrice)`
-2. C 调用 `HarbergerTitleNFT.claimForeclosed(pricePayed=10 TOKEN)`
+1. C 调用 `MockERC20.approve(harbergerContract, 15 TOKEN)`（10 floorPrice + 5 押金）
+2. C 调用 `HarbergerTitleNFT.claimForeclosed(pricePayed=10 TOKEN, depositAmount=5 TOKEN)`
 
-> 注意：floorPrice = 10 TOKEN，所以 C 需要支付 10 TOKEN。如果 floorPrice 设为 0，则 C 可以免费申领。
+> 注意：floorPrice = 10 TOKEN，所以 C 至少需要支付 10 TOKEN；`depositAmount` 是 C 可选带上的押金,同样是为了避免自己申领成功后又立刻被别人重新违约申领(同一个"零押金窗口"问题,详见 README 4.6)。如果 floorPrice 设为 0，则 C 的申领价可以是 0。
 
 **合约内部执行流程**：
 
@@ -163,16 +165,16 @@ isForeclosed     = true
 │ ① 验证 NFT 确实处于 Foreclosure 状态                    │
 │    owedTax > escrowBalance → true ✓                   │
 │                                                       │
-│ ② 从 C 处收取 floorPrice（如果有）                      │
-│    C → 合约：10 TOKEN                                  │
+│ ② 从 C 处收取 floorPrice + 押金（合并为一笔转账）        │
+│    C → 合约：10 TOKEN（floorPrice）+ 5 TOKEN（押金）    │
 │                                                       │
 │ ③ 转移 NFT                                            │
 │    NFT(0) 的持有者：A → C                               │
 │                                                       │
-│ ④ 重置状态                                             │
+│ ④ 重置状态（与②之前的转账合并为一笔交易，原子完成）      │
 │    holder = C                                          │
 │    selfAssessedPrice = floorPrice = 10 TOKEN           │
-│    escrowBalance = 0                                   │
+│    escrowBalance = 5 TOKEN（C 申领时一并充值，不再为 0）│
 │    isForeclosed = false                                │
 │    lastSettlementTime = 当前时间                        │
 │                                                       │
@@ -184,8 +186,8 @@ isForeclosed     = true
 | 角色 | 变化 |
 |------|------|
 | A | 失去 NFT，押金被税金耗尽（0 退还），**净损失** |
-| C | -10 TOKEN（floorPrice），获得 NFT |
-| 合约 | +10 TOKEN（C 支付的 floorPrice）+ A 的押金（已被税金消耗） |
+| C | -10 TOKEN（floorPrice）- 5 TOKEN（自己的新押金），获得 NFT，escrowBalance = 5 TOKEN |
+| 合约 | +10 TOKEN（floorPrice）+ 5 TOKEN（C 的新押金）+ A 的押金（已被税金消耗） |
 
 ---
 
